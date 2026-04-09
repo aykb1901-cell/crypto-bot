@@ -1,23 +1,21 @@
-import os 
-import time 
-from datetime import datetime 
+import os
+import time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import requests 
+import requests
 import yfinance as yf
-BOT_TOKEN = os.getenv("BOT_TOKEN") 
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-if not BOT_TOKEN or not CHAT_ID: raise RuntimeError("BOT_TOKEN or CHAT_ID missing")
+if not BOT_TOKEN or not CHAT_ID:
+    raise RuntimeError("BOT_TOKEN or CHAT_ID missing")
 
-TG_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" UPDATES_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates" SG_TZ = ZoneInfo("Asia/Singapore")
+TG_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+UPDATES_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
 
-BASE = [ "TSLA", "NVDA", "AMD", "COIN", "PLTR", "SOFI", "RIVN", "AMC", "NIO", "META", "AAPL", "MSFT", "AMZN", "NFLX", "HOOD", "MARA", "RIOT" ]
-
-INTERVAL = "1m" INTRADAY_PERIOD = "1d" SCAN_SECONDS = 60 COMMAND_POLL_SECONDS = 3 ALERT_COOLDOWN_SECONDS = 300
-
-last_alert = {} last_update_id = None last_scan_summary = "No scan yet" last_top3 = []
-
+SG_TZ = ZoneInfo("Asia/Singapore")
 def send(msg: str) -> None: try: requests.post( TG_URL, json={"chat_id": CHAT_ID, "text": msg}, timeout=15, ) except Exception as e: print("Telegram send error:", e)
 
 def get_updates(offset=None): params = {"timeout": 5} if offset is not None: params["offset"] = offset try: r = requests.get(UPDATES_URL, params=params, timeout=10) r.raise_for_status() data = r.json() return data.get("result", []) except Exception as e: print("Telegram update error:", e) return []
@@ -295,7 +293,7 @@ if alerts_sent == 0:
 else:
     last_scan_summary = f"{prefix} - {alerts_sent} alert(s) sent\n" + "\n".join(scan_lines[:5])
 
-def build_status() -> str: now = datetime.now(SG_TZ).strftime("%Y-%m-%d %H:%M:%S") ready = ", ".join([x[0] for x in last_top3]) if last_top3 else "Not yet" return ( "📊 BOT STATUS\n" f"Time: {now}\n" f"Session Active: {'YES' if session_active() else 'NO'}\n" f"Universe Size: {len(BASE)}\n" f"Top 3 Ready: {ready}\n" f"Last Scan:\n{last_scan_summary}" )
+def build_status() -> str: now = datetime.now(SG_TZ).strftime("%Y-%m-%d %H:%M:%S") ready = ", ".join([x[0] for x in last_top3]) if last_top3 else "Not yet" retuBOT STATUS\n" f"Time: {now}\n" f"Session Active: {'YES' if session_active() else 'NO'}\n" f"Universe Size: {len(BASE)}\n" f"Top 3 Ready: {ready}\n" f"Last Scan:\n{last_scan_summary}" )
 
 def process_commands() -> None: global last_update_id
 
