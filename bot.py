@@ -22,7 +22,10 @@ FEATURES
 
 ==============================================
 
-import os import time import requests import yfinance as yf from datetime import datetime from zoneinfo import ZoneInfo
+import os 
+import time 
+import requests 
+import yfinance as yf from datetime import datetime from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") CHAT_ID = os.getenv("CHAT_ID")
 
