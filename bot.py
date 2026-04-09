@@ -1,7 +1,7 @@
 import os
-import time from datetime 
-import datetime from zoneinfo 
-import ZoneInfo
+import time 
+from datetime import datetime 
+from zoneinfo import ZoneInfo
 
 import requests 
 import yfinance as yf
