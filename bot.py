@@ -1,610 +1,285 @@
+# ==============================================
+# US STOCK SNIPER ELITE+ FINAL BOT
+# ==============================================
+# FEATURES
+# - Top 3 gappers before / during session
+# - SPY trend filter
+# - Opening range breakout
+# - Auto entry / TP / SL
+# - Confidence score (A+ / B)
+# - Bad day filter
+# - Telegram commands: /test /top /status /help
+# ==============================================
+
 import os
-import csv
 import time
-import json
+import requests
+import yfinance as yf
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import requests
-
-# =========================================================
-# KRAKEN PRO VERSION - ALERT BOT FOR MANUAL COINHAKO EXECUTION
-# =========================================================
-# What this bot does:
-# - Uses Kraken public OHLC data instead of Binance
-# - Sends Telegram alerts with entry / SL / TP
-# - Supports /status /test /help /pause /resume /forcescan /paper
-# - Tracks paper trades to CSV
-# - Uses cooldown + duplicate blocking
-# - Uses a simple risk model for a $2000 account
-#
-# Railway env vars needed:
-# BOT_TOKEN=...
-# CHAT_ID=...
-# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("BOT_TOKEN or CHAT_ID missing in Railway variables")
+    raise RuntimeError("BOT_TOKEN or CHAT_ID missing")
 
-TG_SEND_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-TG_UPDATES_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-
+TG_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+UPDATES_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
 SG_TZ = ZoneInfo("Asia/Singapore")
 
-# =========================
-# SETTINGS
-# =========================
-# Kraken spot pairs mapped to friendly symbols
-WATCHLIST = {
-    "BTCUSD": "BTC/USD",
-    "ETHUSD": "ETH/USD",
-    "SOLUSD": "SOL/USD",
-}
+BASE = [
+    "TSLA","NVDA","AMD","COIN","PLTR","SOFI","RIVN","AMC","NIO",
+    "META","AAPL","MSFT","AMZN","NFLX","HOOD","MARA","RIOT"
+]
 
-INTERVAL_MINUTES = 5
-KLINE_LIMIT = 250
-KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
-KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+INTERVAL = "1m"
+INTRADAY_PERIOD = "1d"
+last_alert = {}
+last_update_id = None
+last_scan_summary = "No scan yet"
+last_top3 = []
 
-SESSION_START = 21
-SESSION_END = 2
-
-ACCOUNT_SIZE = 2000.0
-RISK_PER_TRADE_PCT = 1.0
-MAX_SIGNALS_PER_DAY = 4
-MAX_SIMULTANEOUS_OPEN_PAPER_TRADES = 2
-
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-VOLUME_LOOKBACK = 20
-VOLUME_SPIKE_MULTIPLIER = 1.15
-SIDEWAYS_GAP_THRESHOLD = 0.0012
-MAX_RISK_TO_STOP_PCT = 1.8
-MIN_RISK_TO_STOP_PCT = 0.20
-TP1_R = 1.0
-TP2_R = 1.8
-BREAKEVEN_AFTER_TP1 = True
-
-STATE_FILE = "bot_state.json"
-TRADE_LOG_FILE = "paper_trades.csv"
-COMMAND_POLL_SECONDS = 5
-SCAN_EVERY_SECONDS = 30
-HEARTBEAT_SECONDS = 3600
-
-candles_by_symbol = {}
-current_prices = {}
-last_scan_time = None
-
-# =========================
-# STATE
-# =========================
-def now_sgt() -> datetime:
-    return datetime.now(SG_TZ)
-
-
-def today_sgt() -> str:
-    return now_sgt().strftime("%Y-%m-%d")
-
-
-def default_state() -> dict:
-    return {
-        "date": today_sgt(),
-        "signals_sent": 0,
-        "cooldowns": {},
-        "paused": False,
-        "last_update_id": None,
-        "recent_signals": [],
-        "paper_trades": [],
-        "last_heartbeat_ts": 0,
-        "last_scan_ts": 0,
-    }
-
-
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return default_state()
+# ==============================================
+def send(msg):
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        base = default_state()
-        base.update(state)
-        return base
-    except Exception:
-        return default_state()
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-def reset_daily_state_if_needed(state: dict) -> dict:
-    if state.get("date") != today_sgt():
-        state["date"] = today_sgt()
-        state["signals_sent"] = 0
-        state["cooldowns"] = {}
-        state["recent_signals"] = []
-    return state
-
-# =========================
-# TELEGRAM
-# =========================
-def send_telegram(message: str) -> None:
-    try:
-        requests.post(
-            TG_SEND_URL,
-            json={"chat_id": CHAT_ID, "text": message},
-            timeout=15,
-        )
+        requests.post(TG_URL, json={"chat_id": CHAT_ID, "text": msg}, timeout=15)
     except Exception as e:
         print("Telegram send error:", e)
 
-
+# ==============================================
 def get_updates(offset=None):
-    params = {"timeout": 10}
+    params = {"timeout": 5}
     if offset is not None:
         params["offset"] = offset
     try:
-        r = requests.get(TG_UPDATES_URL, params=params, timeout=20)
+        r = requests.get(UPDATES_URL, params=params, timeout=10)
         r.raise_for_status()
         return r.json().get("result", [])
     except Exception as e:
         print("Telegram update error:", e)
         return []
 
-# =========================
-# INDICATORS
-# =========================
-def ema(values, period: int):
-    if not values:
-        return []
-    k = 2 / (period + 1)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(v * k + out[-1] * (1 - k))
-    return out
-
-
-def rsi(values, period: int = 14):
-    if len(values) < period + 1:
-        return [50.0] * len(values)
-
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-
-    avg_gain = sum(gains[1:period + 1]) / period
-    avg_loss = sum(losses[1:period + 1]) / period
-    out = [50.0] * len(values)
-
-    rs = avg_gain / avg_loss if avg_loss != 0 else 999999
-    out[period] = 100 - (100 / (1 + rs))
-
-    for i in range(period + 1, len(values)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else 999999
-        out[i] = 100 - (100 / (1 + rs))
-
-    return out
-
-
-def atr(candles, period: int = 14):
-    if len(candles) < 2:
-        return [0.0] * len(candles)
-
-    trs = [candles[0]["high"] - candles[0]["low"]]
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i - 1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-
-    out = [trs[0]]
-    for i in range(1, len(trs)):
-        if i < period:
-            out.append(sum(trs[: i + 1]) / (i + 1))
-        else:
-            out.append(((out[-1] * (period - 1)) + trs[i]) / period)
-    return out
-
-# =========================
-# KRAKEN DATA
-# =========================
-def fetch_historical_klines(symbol: str):
-    params = {
-        "pair": symbol,
-        "interval": INTERVAL_MINUTES,
-    }
-    r = requests.get(KRAKEN_OHLC_URL, params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-
-    if payload.get("error"):
-        raise RuntimeError(f"Kraken OHLC error for {symbol}: {payload['error']}")
-
-    result = payload.get("result", {})
-    rows = result.get(symbol)
-    if not rows:
-        # Kraken sometimes returns alternate key names; use first non-last key
-        for k, v in result.items():
-            if k != "last":
-                rows = v
-                break
-    if not rows:
-        raise RuntimeError(f"No OHLC data returned for {symbol}")
-
-    candles = []
-    for row in rows[-KLINE_LIMIT:]:
-        candles.append(
-            {
-                "open_time": int(float(row[0])) * 1000,
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[6]),
-                "close_time": int(float(row[0]) + INTERVAL_MINUTES * 60) * 1000,
-                "closed": True,
-            }
-        )
-    return candles
-
-
-def fetch_ticker_prices(symbols):
-    params = {"pair": ",".join(symbols)}
-    r = requests.get(KRAKEN_TICKER_URL, params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
-
-    if payload.get("error"):
-        raise RuntimeError(f"Kraken ticker error: {payload['error']}")
-
-    result = payload.get("result", {})
-    prices = {}
-    for requested in symbols:
-        if requested in result:
-            prices[requested] = float(result[requested]["c"][0])
-        else:
-            for k, v in result.items():
-                if requested.replace("USD", "") in k and "USD" in k:
-                    prices[requested] = float(v["c"][0])
-                    break
-    return prices
-
-
-def initialize_market_data():
-    global candles_by_symbol, current_prices
-    for symbol in WATCHLIST:
-        candles_by_symbol[symbol] = fetch_historical_klines(symbol)
-        current_prices[symbol] = candles_by_symbol[symbol][-1]["close"]
-        print(f"Loaded {symbol}: {len(candles_by_symbol[symbol])} candles")
-
-# =========================
-# HELPERS
-# =========================
-def in_session() -> bool:
-    hour = now_sgt().hour
-    return hour >= SESSION_START or hour < SESSION_END
-
-
-def format_price(price: float) -> str:
-    if price >= 1000:
-        return f"{price:,.2f}"
-    if price >= 100:
-        return f"{price:,.3f}"
-    if price >= 1:
-        return f"{price:,.4f}"
-    return f"{price:,.6f}"
-
-
-def average_volume(candles, lookback: int, end_index_exclusive: int) -> float:
-    start = max(0, end_index_exclusive - lookback)
-    vols = [c["volume"] for c in candles[start:end_index_exclusive]]
-    return sum(vols) / len(vols) if vols else 0.0
-
-
-def count_open_paper_trades(state: dict) -> int:
-    return sum(1 for t in state["paper_trades"] if t.get("status") == "OPEN")
-
-# =========================
-# SIGNAL ENGINE
-# =========================
-def build_signal(symbol: str, candles):
-    closes = [c["close"] for c in candles]
-    ema_fast_vals = ema(closes, EMA_FAST)
-    ema_slow_vals = ema(closes, EMA_SLOW)
-    rsi_vals = rsi(closes, RSI_PERIOD)
-    atr_vals = atr(candles, ATR_PERIOD)
-
-    i = len(candles) - 1
-    if i < 30:
+# ==============================================
+def get_data(symbol, interval=INTERVAL, period=INTRADAY_PERIOD):
+    try:
+        df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
+        return df
+    except Exception:
         return None
 
-    current = candles[i]
-    prev1 = candles[i - 1]
-    prev2 = candles[i - 2]
-    price = current["close"]
+# ==============================================
+def get_spy_trend():
+    spy = get_data("SPY")
+    if spy is None or len(spy) < 25:
+        return "NEUTRAL"
 
-    gap_pct = abs(ema_fast_vals[i] - ema_slow_vals[i]) / price
-    if gap_pct < SIDEWAYS_GAP_THRESHOLD:
+    ema9 = spy['Close'].ewm(span=9).mean()
+    ema21 = spy['Close'].ewm(span=21).mean()
+
+    if ema9.iloc[-1] > ema21.iloc[-1]:
+        return "BULL"
+    if ema9.iloc[-1] < ema21.iloc[-1]:
+        return "BEAR"
+    return "NEUTRAL"
+
+# ==============================================
+def get_ranked_gappers():
+    results = []
+
+    for s in BASE:
+        try:
+            df = yf.download(s, period="2d", interval="1d", progress=False, auto_adjust=False)
+            if df is None or len(df) < 2:
+                continue
+
+            prev_close = float(df.iloc[-2]['Close'])
+            today_open = float(df.iloc[-1]['Open'])
+            pct = ((today_open - prev_close) / prev_close) * 100
+
+            if abs(pct) > 4:
+                results.append((s, abs(pct), pct))
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:3]
+
+# ==============================================
+def bad_day_filter(spy_trend, df):
+    if spy_trend == "NEUTRAL":
+        return True, "SPY neutral"
+
+    if df is None or len(df) < 30:
+        return True, "Not enough data"
+
+    recent = df.tail(20)
+    avg_range = (recent['High'] - recent['Low']).mean()
+    avg_close = recent['Close'].mean()
+
+    if avg_close == 0:
+        return True, "Invalid price"
+
+    volatility_pct = avg_range / avg_close
+    if volatility_pct < 0.003:
+        return True, "Too little movement"
+
+    return False, "OK"
+
+# ==============================================
+def build_trade(symbol, trend):
+    df = get_data(symbol)
+    if df is None or len(df) < 30:
         return None
 
-    avg_vol = average_volume(candles, VOLUME_LOOKBACK, i)
-    if current["volume"] < avg_vol * VOLUME_SPIKE_MULTIPLIER:
+    blocked, reason = bad_day_filter(trend, df)
+    if blocked:
+        return {"blocked": True, "reason": reason}
+
+    opening = df.head(15)
+    or_high = float(opening['High'].max())
+    or_low = float(opening['Low'].min())
+
+    current = df.iloc[-1]
+    price = float(current['Close'])
+    vol = float(current['Volume'])
+    avg_vol = float(df['Volume'].tail(20).mean())
+
+    if avg_vol <= 0:
         return None
 
-    current_rsi = rsi_vals[i]
-    current_atr = atr_vals[i]
+    volume_ratio = vol / avg_vol
+    risk = 0.4
+    reward = 0.8
+    confidence = "B"
 
-    trend_up = price > ema_slow_vals[i] and ema_fast_vals[i] > ema_slow_vals[i]
-    pullback_long = prev1["low"] <= ema_fast_vals[i - 1] or prev2["low"] <= ema_fast_vals[i - 2]
-    breakout_long = current["close"] > current["open"] and current["close"] > prev1["high"]
+    if volume_ratio >= 2.5:
+        confidence = "A+"
+    elif volume_ratio >= 2.0:
+        confidence = "A"
 
-    if trend_up and pullback_long and breakout_long and current_rsi >= 50:
+    # BUY
+    if price > or_high and trend == "BULL":
         entry = price
-        stop = min(prev1["low"], prev2["low"], ema_slow_vals[i]) - (current_atr * 0.20)
-        if stop < entry:
-            risk_pct = ((entry - stop) / entry) * 100
-            if MIN_RISK_TO_STOP_PCT <= risk_pct <= MAX_RISK_TO_STOP_PCT:
-                risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PCT / 100)
-                position_size = risk_amount / ((entry - stop) / entry)
-                tp1 = entry + (entry - stop) * TP1_R
-                tp2 = entry + (entry - stop) * TP2_R
-                return {
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "entry": entry,
-                    "stop_loss": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "risk_pct": risk_pct,
-                    "position_size": position_size,
-                    "reason": f"Trend up + pullback + breakout + RSI {current_rsi:.1f}",
-                    "bar_time": current["close_time"],
-                }
+        sl = entry - risk
+        tp = entry + reward
+        return {
+            "blocked": False,
+            "side": "BUY",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "confidence": confidence,
+            "volume_ratio": volume_ratio,
+            "or_high": or_high,
+        }
 
-    trend_down = price < ema_slow_vals[i] and ema_fast_vals[i] < ema_slow_vals[i]
-    pullback_short = prev1["high"] >= ema_fast_vals[i - 1] or prev2["high"] >= ema_fast_vals[i - 2]
-    breakdown_short = current["close"] < current["open"] and current["close"] < prev1["low"]
-
-    if trend_down and pullback_short and breakdown_short and current_rsi <= 50:
+    # SELL
+    if price < or_low and trend == "BEAR":
         entry = price
-        stop = max(prev1["high"], prev2["high"], ema_slow_vals[i]) + (current_atr * 0.20)
-        if stop > entry:
-            risk_pct = ((stop - entry) / entry) * 100
-            if MIN_RISK_TO_STOP_PCT <= risk_pct <= MAX_RISK_TO_STOP_PCT:
-                risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PCT / 100)
-                position_size = risk_amount / ((stop - entry) / entry)
-                tp1 = entry - (stop - entry) * TP1_R
-                tp2 = entry - (stop - entry) * TP2_R
-                return {
-                    "symbol": symbol,
-                    "side": "SELL",
-                    "entry": entry,
-                    "stop_loss": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "risk_pct": risk_pct,
-                    "position_size": position_size,
-                    "reason": f"Trend down + pullback + breakdown + RSI {current_rsi:.1f}",
-                    "bar_time": current["close_time"],
-                }
+        sl = entry + risk
+        tp = entry - reward
+        return {
+            "blocked": False,
+            "side": "SELL",
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "confidence": confidence,
+            "volume_ratio": volume_ratio,
+            "or_low": or_low,
+        }
 
     return None
 
+# ==============================================
+def build_top_message(top3):
+    if not top3:
+        return "📋 TOP 3 TODAY\nNo strong gappers found"
 
-def build_signal_message(signal: dict) -> str:
-    icon = "🟢" if signal["side"] == "BUY" else "🔴"
-    pretty = WATCHLIST.get(signal["symbol"], signal["symbol"])
-    return (
-        f"{icon} {signal['side']} ALERT - {pretty}\n"
-        f"Entry: {format_price(signal['entry'])}\n"
-        f"SL: {format_price(signal['stop_loss'])} ({signal['risk_pct']:.2f}%)\n"
-        f"TP1: {format_price(signal['tp1'])}\n"
-        f"TP2: {format_price(signal['tp2'])}\n"
-        f"Suggested size: ${signal['position_size']:.0f}\n"
-        f"Why: {signal['reason']}\n"
-        f"Manual execution on Coinhako only."
-    )
+    lines = ["📋 TOP 3 TODAY"]
+    for idx, item in enumerate(top3, start=1):
+        sym, abs_pct, signed_pct = item
+        direction = "+" if signed_pct >= 0 else ""
+        lines.append(f"{idx}. {sym} ({direction}{signed_pct:.2f}%)")
+    return "\n".join(lines)
 
-# =========================
-# PAPER TRADE LOGGING
-# =========================
-def ensure_trade_log_file():
-    if os.path.exists(TRADE_LOG_FILE):
+# ==============================================
+def scan():
+    global last_scan_summary, last_top3
+
+    trend = get_spy_trend()
+    ranked = get_ranked_gappers()
+    watchlist = [x[0] for x in ranked]
+    last_top3 = ranked
+
+    if not watchlist:
+        last_scan_summary = f"{datetime.now(SG_TZ).strftime('%H:%M:%S')} - no gappers"
         return
-    with open(TRADE_LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "opened_at", "closed_at", "symbol", "side", "entry", "stop_loss",
-            "tp1", "tp2", "exit_price", "status", "result", "pnl_r", "pnl_usd"
-        ])
 
+    alerts_sent = 0
+    scan_lines = []
 
-def append_closed_trade_to_csv(trade: dict):
-    with open(TRADE_LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            trade.get("opened_at"), trade.get("closed_at"), trade.get("symbol"), trade.get("side"),
-            trade.get("entry"), trade.get("stop_loss"), trade.get("tp1"), trade.get("tp2"),
-            trade.get("exit_price"), trade.get("status"), trade.get("result"), trade.get("pnl_r"),
-            trade.get("pnl_usd")
-        ])
+    for symbol in watchlist:
+        trade = build_trade(symbol, trend)
 
-
-def open_paper_trade(signal: dict, state: dict):
-    trade = {
-        "opened_at": now_sgt().strftime("%Y-%m-%d %H:%M:%S"),
-        "closed_at": None,
-        "symbol": signal["symbol"],
-        "side": signal["side"],
-        "entry": signal["entry"],
-        "stop_loss": signal["stop_loss"],
-        "tp1": signal["tp1"],
-        "tp2": signal["tp2"],
-        "exit_price": None,
-        "status": "OPEN",
-        "result": None,
-        "pnl_r": None,
-        "pnl_usd": None,
-        "tp1_hit": False,
-        "breakeven_active": False,
-    }
-    state["paper_trades"].append(trade)
-
-
-def update_paper_trades(state: dict):
-    changed = False
-    risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PCT / 100)
-
-    for trade in state["paper_trades"]:
-        if trade["status"] != "OPEN":
+        if not trade:
+            scan_lines.append(f"{symbol}: no setup")
             continue
 
-        symbol = trade["symbol"]
-        price = current_prices.get(symbol)
-        if price is None:
+        if trade.get("blocked"):
+            scan_lines.append(f"{symbol}: blocked ({trade['reason']})")
             continue
 
-        entry = trade["entry"]
-        stop = trade["stop_loss"]
-        tp1 = trade["tp1"]
-        tp2 = trade["tp2"]
-        side = trade["side"]
+        key = f"{symbol}_{trade['side']}"
+        if key in last_alert and time.time() - last_alert[key] < 300:
+            scan_lines.append(f"{symbol}: cooldown")
+            continue
 
-        if side == "BUY":
-            if (not trade["tp1_hit"]) and price >= tp1:
-                trade["tp1_hit"] = True
-                if BREAKEVEN_AFTER_TP1:
-                    trade["breakeven_active"] = True
-                send_telegram(f"🎯 TP1 HIT - {WATCHLIST.get(symbol, symbol)} BUY @ {format_price(price)}")
-                changed = True
+        if trade['confidence'] not in ["A+", "A"]:
+            scan_lines.append(f"{symbol}: low confidence")
+            continue
 
-            current_stop = entry if trade["breakeven_active"] else stop
-            if price <= current_stop:
-                trade["status"] = "CLOSED"
-                trade["closed_at"] = now_sgt().strftime("%Y-%m-%d %H:%M:%S")
-                trade["exit_price"] = price
-                if trade["tp1_hit"] and trade["breakeven_active"] and price <= entry:
-                    trade["result"] = "BREAKEVEN_AFTER_TP1"
-                    trade["pnl_r"] = 0.5
-                    trade["pnl_usd"] = round(risk_amount * 0.5, 2)
-                else:
-                    trade["result"] = "STOP_LOSS"
-                    trade["pnl_r"] = -1.0
-                    trade["pnl_usd"] = round(-risk_amount, 2)
-                append_closed_trade_to_csv(trade)
-                changed = True
-                continue
+        msg = (
+            f"🔥 ELITE+ SNIPER {symbol}\n"
+            f"Trend: {trend}\n"
+            f"Confidence: {trade['confidence']}\n"
+            f"Entry: {trade['entry']:.2f}\n"
+            f"TP: {trade['tp']:.2f}\n"
+            f"SL: {trade['sl']:.2f}\n"
+            f"Vol Ratio: {trade['volume_ratio']:.2f}x\n"
+            f"Rule: Only take if still near entry and breakout is clean"
+        )
+        send(msg)
+        last_alert[key] = time.time()
+        alerts_sent += 1
+        scan_lines.append(f"{symbol}: alert sent ({trade['confidence']})")
 
-            if price >= tp2:
-                trade["status"] = "CLOSED"
-                trade["closed_at"] = now_sgt().strftime("%Y-%m-%d %H:%M:%S")
-                trade["exit_price"] = price
-                trade["result"] = "TP2"
-                trade["pnl_r"] = 1.4 if trade["tp1_hit"] else 1.8
-                trade["pnl_usd"] = round(risk_amount * trade["pnl_r"], 2)
-                append_closed_trade_to_csv(trade)
-                send_telegram(f"🏁 TP2 HIT - {WATCHLIST.get(symbol, symbol)} BUY @ {format_price(price)}")
-                changed = True
-                continue
+    if alerts_sent == 0:
+        last_scan_summary = f"{datetime.now(SG_TZ).strftime('%H:%M:%S')} - no A/A+ setup\n" + "\n".join(scan_lines[:5])
+    else:
+        last_scan_summary = f"{datetime.now(SG_TZ).strftime('%H:%M:%S')} - {alerts_sent} alert(s) sent\n" + "\n".join(scan_lines[:5])
 
-        elif side == "SELL":
-            if (not trade["tp1_hit"]) and price <= tp1:
-                trade["tp1_hit"] = True
-                if BREAKEVEN_AFTER_TP1:
-                    trade["breakeven_active"] = True
-                send_telegram(f"🎯 TP1 HIT - {WATCHLIST.get(symbol, symbol)} SELL @ {format_price(price)}")
-                changed = True
-
-            current_stop = entry if trade["breakeven_active"] else stop
-            if price >= current_stop:
-                trade["status"] = "CLOSED"
-                trade["closed_at"] = now_sgt().strftime("%Y-%m-%d %H:%M:%S")
-                trade["exit_price"] = price
-                if trade["tp1_hit"] and trade["breakeven_active"] and price >= entry:
-                    trade["result"] = "BREAKEVEN_AFTER_TP1"
-                    trade["pnl_r"] = 0.5
-                    trade["pnl_usd"] = round(risk_amount * 0.5, 2)
-                else:
-                    trade["result"] = "STOP_LOSS"
-                    trade["pnl_r"] = -1.0
-                    trade["pnl_usd"] = round(-risk_amount, 2)
-                append_closed_trade_to_csv(trade)
-                changed = True
-                continue
-
-            if price <= tp2:
-                trade["status"] = "CLOSED"
-                trade["closed_at"] = now_sgt().strftime("%Y-%m-%d %H:%M:%S")
-                trade["exit_price"] = price
-                trade["result"] = "TP2"
-                trade["pnl_r"] = 1.4 if trade["tp1_hit"] else 1.8
-                trade["pnl_usd"] = round(risk_amount * trade["pnl_r"], 2)
-                append_closed_trade_to_csv(trade)
-                send_telegram(f"🏁 TP2 HIT - {WATCHLIST.get(symbol, symbol)} SELL @ {format_price(price)}")
-                changed = True
-                continue
-
-    if changed:
-        save_state(state)
-
-
-def paper_trade_summary(state: dict) -> str:
-    closed = [t for t in state["paper_trades"] if t.get("status") == "CLOSED"]
-    if not closed:
-        return "No closed paper trades yet"
-
-    wins = sum(1 for t in closed if (t.get("pnl_usd") or 0) > 0)
-    losses = sum(1 for t in closed if (t.get("pnl_usd") or 0) < 0)
-    total = sum((t.get("pnl_usd") or 0) for t in closed)
-    win_rate = (wins / len(closed)) * 100 if closed else 0
+# ==============================================
+def build_status():
+    now = datetime.now(SG_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    in_session = (21 <= datetime.now(SG_TZ).hour or datetime.now(SG_TZ).hour < 2)
     return (
-        f"Closed trades: {len(closed)}\n"
-        f"Wins: {wins}\n"
-        f"Losses: {losses}\n"
-        f"Win rate: {win_rate:.1f}%\n"
-        f"Paper PnL: ${total:.2f}"
+        "📊 BOT STATUS\n"
+        f"Time: {now}\n"
+        f"Session Active: {'YES' if in_session else 'NO'}\n"
+        f"Universe Size: {len(BASE)}\n"
+        f"Top 3 Ready: {', '.join([x[0] for x in last_top3]) if last_top3 else 'Not yet'}\n"
+        f"Last Scan:\n{last_scan_summary}"
     )
 
-# =========================
-# COMMANDS
-# =========================
-def build_status_message(state: dict) -> str:
-    session_text = "YES" if in_session() else "NO"
-    watched = ", ".join(WATCHLIST.values())
-    recent = "\n".join(state.get("recent_signals", [])[-5:]) or "No recent signals"
-    open_count = count_open_paper_trades(state)
-    return (
-        "📊 Bot Status\n"
-        f"Time: {now_sgt().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Session active: {session_text}\n"
-        f"Paused: {'YES' if state.get('paused') else 'NO'}\n"
-        f"Watchlist: {watched}\n"
-        f"Interval: {INTERVAL_MINUTES}m\n"
-        f"Signals sent today: {state.get('signals_sent', 0)}\n"
-        f"Open paper trades: {open_count}\n"
-        f"Last scan: {last_scan_time or 'Not yet'}\n\n"
-        f"Recent signals:\n{recent}"
-    )
-
-
-def process_telegram_commands(state: dict):
-    offset = state.get("last_update_id")
-    updates = get_updates(None if offset is None else offset + 1)
+# ==============================================
+def process_commands():
+    global last_update_id
+    updates = get_updates(None if last_update_id is None else last_update_id + 1)
 
     for item in updates:
-        state["last_update_id"] = item["update_id"]
+        last_update_id = item["update_id"]
         message = item.get("message", {})
         text = (message.get("text") or "").strip().lower()
         chat_id = str(message.get("chat", {}).get("id", ""))
@@ -612,158 +287,47 @@ def process_telegram_commands(state: dict):
         if chat_id != str(CHAT_ID):
             continue
 
-        if text == "/status":
-            send_telegram(build_status_message(state))
-        elif text == "/test":
-            send_telegram("✅ Test reply from bot")
-        elif text == "/pause":
-            state["paused"] = True
-            save_state(state)
-            send_telegram("⏸ Bot paused. It will still answer commands.")
-        elif text == "/resume":
-            state["paused"] = False
-            save_state(state)
-            send_telegram("▶️ Bot resumed.")
-        elif text == "/forcescan":
-            force_scan(state, ignore_session=True)
-        elif text == "/paper":
-            send_telegram("🧾 Paper trade summary\n" + paper_trade_summary(state))
+        if text == "/test":
+            send("✅ Test reply from ELITE+ bot")
+        elif text == "/top":
+            send(build_top_message(get_ranked_gappers()))
+        elif text == "/status":
+            send(build_status())
         elif text == "/help":
-            send_telegram(
+            send(
                 "Commands:\n"
+                "/test - test bot\n"
+                "/top - show top 3 gappers\n"
                 "/status - bot status\n"
-                "/test - test reply\n"
-                "/pause - pause alerts\n"
-                "/resume - resume alerts\n"
-                "/forcescan - scan now\n"
-                "/paper - paper trade summary\n"
-                "/help - show commands"
+                "/help - command list"
             )
 
-    save_state(state)
-
-# =========================
-# REFRESH MARKET DATA
-# =========================
-def refresh_market_data():
-    global current_prices
-
-    prices = fetch_ticker_prices(list(WATCHLIST.keys()))
-    for symbol, price in prices.items():
-        current_prices[symbol] = price
-
-    for symbol in WATCHLIST:
-        candles_by_symbol[symbol] = fetch_historical_klines(symbol)
-
-# =========================
-# CORE SCAN
-# =========================
-def register_signal(signal: dict, state: dict):
-    stamp = now_sgt().strftime("%H:%M:%S")
-    line = f"{stamp} - {signal['side']} {WATCHLIST.get(signal['symbol'], signal['symbol'])} @ {format_price(signal['entry'])}"
-    state["recent_signals"].append(line)
-    state["recent_signals"] = state["recent_signals"][-10:]
-    state["signals_sent"] += 1
-    state["cooldowns"][f"{signal['symbol']}_{signal['side']}"] = signal["bar_time"]
-    save_state(state)
-
-
-def can_send_signal(signal: dict, state: dict) -> bool:
-    if state.get("paused"):
-        return False
-    if state.get("signals_sent", 0) >= MAX_SIGNALS_PER_DAY:
-        return False
-    if count_open_paper_trades(state) >= MAX_SIMULTANEOUS_OPEN_PAPER_TRADES:
-        return False
-
-    key = f"{signal['symbol']}_{signal['side']}"
-    last_bar = state.get("cooldowns", {}).get(key, 0)
-    if signal["bar_time"] == last_bar:
-        return False
-    return True
-
-
-def force_scan(state: dict, ignore_session=False):
-    global last_scan_time
-    if (not ignore_session) and (not in_session()):
-        return
-
-    state = reset_daily_state_if_needed(state)
-    refresh_market_data()
-
-    for symbol in WATCHLIST:
-        candles = candles_by_symbol.get(symbol)
-        if not candles or len(candles) < 40:
-            continue
-
-        signal = build_signal(symbol, candles)
-        if not signal:
-            continue
-
-        if not can_send_signal(signal, state):
-            continue
-
-        msg = build_signal_message(signal)
-        print(msg)
-        send_telegram(msg)
-        open_paper_trade(signal, state)
-        register_signal(signal, state)
-
-    last_scan_time = now_sgt().strftime("%Y-%m-%d %H:%M:%S")
-    state["last_scan_ts"] = time.time()
-    save_state(state)
-
-# =========================
-# MAIN LOOP
-# =========================
+# ==============================================
 def main():
-    global last_scan_time
-
-    ensure_trade_log_file()
-    state = load_state()
-    initialize_market_data()
-
-    send_telegram("✅ Kraken pro bot running (Cloud). Manual Coinhako execution only.")
+    send("🚀 ELITE+ FINAL BOT STARTED")
     print("Bot started...")
 
-    last_command_poll = 0.0
+    last_scan = 0
 
     while True:
         try:
-            state = reset_daily_state_if_needed(state)
+            process_commands()
 
-            update_paper_trades(state)
-
-            if time.time() - last_command_poll >= COMMAND_POLL_SECONDS:
-                process_telegram_commands(state)
-                last_command_poll = time.time()
-
-            if time.time() - state.get("last_heartbeat_ts", 0) >= HEARTBEAT_SECONDS:
-                send_telegram(
-                    "🤖 Bot heartbeat\n"
-                    f"Time: {now_sgt().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Session active: {'YES' if in_session() else 'NO'}\n"
-                    f"Signals today: {state.get('signals_sent', 0)}"
-                )
-                state["last_heartbeat_ts"] = time.time()
-                save_state(state)
-
-            if time.time() - state.get("last_scan_ts", 0) >= SCAN_EVERY_SECONDS:
-                if in_session() and (not state.get("paused")):
-                    force_scan(state, ignore_session=True)
-                else:
-                    refresh_market_data()
-                    print("Outside session")
-                    state["last_scan_ts"] = time.time()
-                    save_state(state)
+            now = datetime.now(SG_TZ)
+            if 21 <= now.hour or now.hour < 2:
+                if time.time() - last_scan >= 60:
+                    scan()
+                    last_scan = time.time()
+            else:
+                print("Outside US session")
 
         except Exception as e:
             print("Main loop error:", e)
-            send_telegram(f"⚠️ Bot error: {str(e)[:200]}")
-            time.sleep(10)
+            send(f"⚠️ Bot error: {str(e)[:200]}")
+            time.sleep(5)
 
-        time.sleep(1)
+        time.sleep(2)
 
-
+# ==============================================
 if __name__ == "__main__":
     main()
